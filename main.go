@@ -27,20 +27,27 @@ const (
 	DefaultKeyPath               = "/etc/kubernetes/pki/etcd/"
 	DefaultEtcdHost              = "https://localhost:2379"
 	DefaultPrometheusURL         = "http://prometheus-k8s.monitoring.svc.cluster.local:9090"
+	EtcdKeyPrefix                = "/registry/kcas-energy/pods/"
 )
 
 type UsageEntry struct {
-	Timestamp     string  `json:"timestamp"`
-	MaxEnergyUsage int64 `json:"max_energy_usage"`
+	Timestamp      string `json:"timestamp"`
+	MaxEnergyUsage int64  `json:"max_energy_usage"`
 }
 
 type PodUsage struct {
 	UsageHistory []UsageEntry `json:"usage_history"`
 }
 
+type EtcdData struct {
+	Pods map[string]PodUsage `json:"pods"`
+}
+
 func main() {
+	// Initialize clients
 	etcdClient, err := initializeEtcdClient()
 	handleFatalError("Error initializing etcd client", err)
+	defer etcdClient.Close()
 
 	promClient, err := initializePrometheusClient()
 	handleFatalError("Error initializing Prometheus client", err)
@@ -48,9 +55,14 @@ func main() {
 	kubeClient, err := initializeKubernetesClient()
 	handleFatalError("Error initializing Kubernetes client", err)
 
+	// Fetch Kubernetes pod list
 	pods, err := fetchPodList(kubeClient)
 	handleFatalError("Error fetching pod list", err)
 
+	// Initialize Etcd data
+	initializeEtcdData(context.Background(), etcdClient, EtcdKeyPrefix)
+
+	// Process pods
 	processPods(pods, etcdClient, promClient)
 }
 
@@ -139,45 +151,71 @@ func calculatePodEnergyUsage(podName string, promClient promv1.API) (int64, erro
 
 // Updates the pod's energy usage data in etcd.
 func updatePodUsage(ctx context.Context, etcdClient *clientv3.Client, podName string, energyUsage int64) {
-	key := fmt.Sprintf("/registry/kcas/pods/%s", podName)
+	key := EtcdKeyPrefix 
 	usageEntry := UsageEntry{
-		Timestamp:     time.Now().Format(time.RFC3339),
+		Timestamp:      time.Now().Format(time.RFC3339),
 		MaxEnergyUsage: energyUsage,
 	}
 
 	resp, err := etcdClient.Get(ctx, key)
-	if err != nil || len(resp.Kvs) == 0 {
-		initializePodUsage(ctx, etcdClient, key, usageEntry)
-		return
-	}
-
-	var podUsage PodUsage
-	if err := json.Unmarshal(resp.Kvs[0].Value, &podUsage); err != nil {
-		log.Printf("Error unmarshalling data for pod %s: %v", podName, err)
-		return
-	}
-
-	podUsage.UsageHistory = append(podUsage.UsageHistory, usageEntry)
-	savePodUsage(ctx, etcdClient, key, podUsage)
-}
-
-// Helper to initialize pod usage in etcd.
-func initializePodUsage(ctx context.Context, etcdClient *clientv3.Client, key string, usageEntry UsageEntry) {
-	podUsage := PodUsage{UsageHistory: []UsageEntry{usageEntry}}
-	savePodUsage(ctx, etcdClient, key, podUsage)
-}
-
-// Saves pod usage to etcd.
-func savePodUsage(ctx context.Context, etcdClient *clientv3.Client, key string, podUsage PodUsage) {
-	data, err := json.Marshal(podUsage)
 	if err != nil {
-		log.Printf("Error marshalling data for key %s: %v", key, err)
+		log.Printf("Error fetching etcd data for key %s: %v", key, err)
 		return
 	}
 
-	if _, err := etcdClient.Put(ctx, key, string(data)); err != nil {
+	var etcdData EtcdData
+	if len(resp.Kvs) > 0 {
+		if err := json.Unmarshal(resp.Kvs[0].Value, &etcdData); err != nil {
+			log.Printf("Error unmarshalling etcd data for key %s: %v", key, err)
+			return
+		}
+	} else {
+		etcdData = EtcdData{Pods: make(map[string]PodUsage)}
+	}
+
+	podUsage := etcdData.Pods[podName]
+	
+	// Checks if an entry already exists within the last 5 minutes
+	if hasRecentEntry(podUsage.UsageHistory) {
+		log.Printf("Skipping update for pod %s: entry already exists within 5 minutes", podName)
+		return
+	}
+	podUsage.UsageHistory = append(podUsage.UsageHistory, usageEntry)
+	etcdData.Pods[podName] = podUsage
+
+	saveEtcdData(ctx, etcdClient, key, etcdData)
+}
+
+// Saves pod usage data to etcd.
+func saveEtcdData(ctx context.Context, etcdClient *clientv3.Client, key string, data EtcdData) {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("Error marshalling etcd data for key %s: %v", key, err)
+		return
+	}
+
+	if _, err := etcdClient.Put(ctx, key, string(jsonData)); err != nil {
 		log.Printf("Error writing data to etcd for key %s: %v", key, err)
 	}
+}
+
+// Checks if an entry has been added in the last 5 minutes
+func hasRecentEntry(usageHistory []UsageEntry) bool {
+	now := time.Now()
+	threshold := now.Add(-5 * time.Minute)
+
+	for _, entry := range usageHistory {
+		entryTime, err := time.Parse(time.RFC3339, entry.Timestamp)
+		if err != nil {
+			log.Printf("Error parsing timestamp %s: %v", entry.Timestamp, err)
+			continue
+		}
+		if entryTime.After(threshold) {
+			return true // A recent entry exists
+		}
+	}
+
+	return false
 }
 
 // Utility functions
@@ -203,6 +241,15 @@ func loadCerts() (*x509.CertPool, tls.Certificate, error) {
 	caCertPool := x509.NewCertPool()
 	caCertPool.AppendCertsFromPEM(caCert)
 	return caCertPool, cert, nil
+}
+
+// Initializes Etcd data if the key is not present.
+func initializeEtcdData(ctx context.Context, etcdClient *clientv3.Client, key string) {
+	resp, err := etcdClient.Get(ctx, key)
+	if err != nil || len(resp.Kvs) == 0 {
+		etcdData := EtcdData{Pods: make(map[string]PodUsage)}
+		saveEtcdData(ctx, etcdClient, key, etcdData)
+	}
 }
 
 func handleFatalError(message string, err error) {
